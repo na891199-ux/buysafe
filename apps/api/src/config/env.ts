@@ -1,3 +1,5 @@
+import "dotenv/config";
+
 const requiredEnv = ["SUPABASE_URL", "SUPABASE_KEY"] as const;
 
 type RequiredEnvKey = (typeof requiredEnv)[number];

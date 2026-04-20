@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 
-import { getEnvConfig } from "../config/env";
+import { getEnvConfig } from "../config/env.js";
 
 const { SUPABASE_URL, SUPABASE_KEY } = getEnvConfig();
 
