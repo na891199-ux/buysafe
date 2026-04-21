@@ -68,14 +68,315 @@ type Reason = {
   explanation: string;
 };
 
+type AdminUser = {
+  id: string;
+  email?: string;
+  created_at?: string;
+  last_sign_in_at?: string;
+  app_metadata?: {
+    role?: string;
+    is_admin?: boolean;
+  };
+  user_metadata?: {
+    name?: string;
+    role?: string;
+    is_admin?: boolean;
+  };
+};
+
 function sendJson(response: http.ServerResponse, statusCode: number, payload: unknown) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "http://localhost:5173",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   response.end(JSON.stringify(payload));
+}
+
+function readJsonBody(request: http.IncomingMessage) {
+  return new Promise<Record<string, unknown>>((resolve, reject) => {
+    let body = "";
+
+    request.on("data", (chunk) => {
+      body += chunk;
+
+      if (body.length > 1_000_000) {
+        request.destroy();
+        reject(new Error("Request body is too large."));
+      }
+    });
+
+    request.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body) as Record<string, unknown>);
+      } catch {
+        reject(new Error("Invalid JSON body."));
+      }
+    });
+
+    request.on("error", reject);
+  });
+}
+
+function readStringField(body: Record<string, unknown>, field: string) {
+  const value = body[field];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getBearerToken(request: http.IncomingMessage) {
+  const authorization = request.headers.authorization;
+
+  if (!authorization?.startsWith("Bearer ")) {
+    return null;
+  }
+
+  return authorization.slice("Bearer ".length);
+}
+
+function isAdminUser(user: AdminUser | null) {
+  if (!user) return false;
+
+  return (
+    user.app_metadata?.role === "admin" ||
+    user.app_metadata?.is_admin === true ||
+    user.user_metadata?.role === "admin" ||
+    user.user_metadata?.is_admin === true
+  );
+}
+
+async function requireAdmin(request: http.IncomingMessage, response: http.ServerResponse) {
+  const token = getBearerToken(request);
+
+  if (!token) {
+    sendJson(response, 401, { error: "Admin authentication is required." });
+    return null;
+  }
+
+  const { data, error } = await supabase.auth.getUser(token);
+
+  if (error || !data.user) {
+    sendJson(response, 401, { error: "Invalid admin session." });
+    return null;
+  }
+
+  if (!isAdminUser(data.user as AdminUser)) {
+    sendJson(response, 403, { error: "Admin permission is required." });
+    return null;
+  }
+
+  return data.user;
+}
+
+async function countRows(table: string) {
+  const { count, error } = await supabase.from(table).select("*", { count: "exact", head: true });
+
+  if (error) {
+    return { table, count: 0, error: error.message };
+  }
+
+  return { table, count: count ?? 0 };
+}
+
+async function listAllAuthUsers() {
+  const users: AdminUser[] = [];
+  let page = 1;
+
+  while (page <= 20) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 100 });
+
+    if (error) {
+      throw error;
+    }
+
+    users.push(...(data.users as AdminUser[]));
+
+    if (data.users.length < 100) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  return users;
+}
+
+function groupCount<T extends string | undefined | null>(values: T[]) {
+  return values.reduce<Record<string, number>>((acc, value) => {
+    const key = value || "UNKNOWN";
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
+async function handleAdminOverview(request: http.IncomingMessage, response: http.ServerResponse) {
+  const adminUser = await requireAdmin(request, response);
+
+  if (!adminUser) {
+    return;
+  }
+
+  const [
+    authUsers,
+    tableCounts,
+    recentQueriesResult,
+    queryResultsResult,
+    regulationsResult,
+    newsResult,
+    reasonsResult,
+  ] = await Promise.all([
+    listAllAuthUsers(),
+    Promise.all([
+      countRows("svc_user"),
+      countRows("svc_session"),
+      countRows("svc_query_log"),
+      countRows("svc_query_result"),
+      countRows("res_hs_mapin_fin"),
+      countRows("res_regulation_std"),
+      countRows("res_taxcalc_std"),
+      countRows("res_combtax_risk"),
+      countRows("svc_news_map"),
+      countRows("reason_res"),
+      countRows("svc_result_view_log"),
+    ]),
+    supabase
+      .from("svc_query_log")
+      .select("query_log_id, product_id, input_value, request_status, requested_at, option_json")
+      .order("requested_at", { ascending: false })
+      .limit(10),
+    supabase
+      .from("svc_query_result")
+      .select("query_result_id, product_id, result_status, created_at")
+      .order("created_at", { ascending: false })
+      .limit(10),
+    supabase
+      .from("res_regulation_std")
+      .select("risk_id, product_id, risk_level, kc_required, risk_summary, created_at")
+      .order("created_at", { ascending: false })
+      .limit(10),
+    supabase
+      .from("svc_news_map")
+      .select("news_map_id, hs_id, risk_type, title, source_nm, is_active, published_at")
+      .order("published_at", { ascending: false })
+      .limit(10),
+    supabase
+      .from("reason_res")
+      .select("reason_id, target_type, target_id, reason_type, created_at")
+      .order("created_at", { ascending: false })
+      .limit(10),
+  ]);
+
+  const tableCountsByName = Object.fromEntries(
+    tableCounts.map((item) => [item.table, { count: item.count, error: "error" in item ? item.error : null }]),
+  );
+
+  const resultRows = queryResultsResult.data ?? [];
+  const regulationRows = regulationsResult.data ?? [];
+  const newsRows = newsResult.data ?? [];
+
+  sendJson(response, 200, {
+    data: {
+      admin: {
+        id: adminUser.id,
+        email: adminUser.email,
+      },
+      stats: {
+        authUsers: authUsers.length,
+        admins: authUsers.filter((user) => isAdminUser(user)).length,
+        activeNews: newsRows.filter((item) => item.is_active).length,
+        tableCounts: tableCountsByName,
+        resultStatus: groupCount(resultRows.map((item) => item.result_status)),
+        riskLevels: groupCount(regulationRows.map((item) => item.risk_level)),
+        kcRequired: regulationRows.filter((item) => item.kc_required).length,
+      },
+      users: authUsers
+        .slice()
+        .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))
+        .slice(0, 12)
+        .map((user) => ({
+          id: user.id,
+          email: user.email,
+          name: user.user_metadata?.name ?? "",
+          role: user.app_metadata?.role ?? user.user_metadata?.role ?? "user",
+          isAdmin: isAdminUser(user),
+          createdAt: user.created_at,
+          lastSignInAt: user.last_sign_in_at,
+        })),
+      queries: (recentQueriesResult.data ?? []).map((query) => ({
+        id: query.query_log_id,
+        productId: query.product_id,
+        status: query.request_status,
+        requestedAt: query.requested_at,
+        inputValue: query.input_value,
+        productTitle: query.option_json?.title ?? query.option_json?.slug ?? "Unknown product",
+        asin: query.option_json?.asin ?? "",
+      })),
+      results: resultRows,
+      regulations: regulationRows,
+      news: newsRows,
+      reasons: reasonsResult.data ?? [],
+    },
+  });
+}
+
+async function handleSignup(request: http.IncomingMessage, response: http.ServerResponse) {
+  const body = await readJsonBody(request);
+  const name = readStringField(body, "name");
+  const email = readStringField(body, "email");
+  const password = readStringField(body, "password");
+  const agreements = body.agreements && typeof body.agreements === "object" ? body.agreements : {};
+
+  if (!name || !email || !password) {
+    sendJson(response, 400, { error: "Name, email, and password are required." });
+    return;
+  }
+
+  // TODO: When BuySafe is ready for public launch, switch back to email verification.
+  // Use supabase.auth.signUp(...) and require users to confirm their email before login.
+  const { data, error } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: {
+      name,
+      agreements,
+    },
+  });
+
+  if (error) {
+    sendJson(response, 400, { error: error.message, code: error.code });
+    return;
+  }
+
+  sendJson(response, 200, { data });
+}
+
+async function handleLogin(request: http.IncomingMessage, response: http.ServerResponse) {
+  const body = await readJsonBody(request);
+  const email = readStringField(body, "email");
+  const password = readStringField(body, "password");
+
+  if (!email || !password) {
+    sendJson(response, 400, { error: "Email and password are required." });
+    return;
+  }
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+
+  if (error) {
+    sendJson(response, 401, { error: error.message, code: error.code });
+    return;
+  }
+
+  sendJson(response, 200, { data });
 }
 
 function extractAsin(value: string | null) {
@@ -250,6 +551,39 @@ const server = http.createServer(async (request, response) => {
   }
 
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host}`);
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/signup") {
+    try {
+      await handleSignup(request, response);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : "Unknown server error",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/auth/login") {
+    try {
+      await handleLogin(request, response);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : "Unknown server error",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/admin/overview") {
+    try {
+      await handleAdminOverview(request, response);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : "Unknown server error",
+      });
+    }
+    return;
+  }
 
   if (request.method !== "GET" || requestUrl.pathname !== "/api/product-lookup") {
     sendJson(response, 404, { error: "Not found" });

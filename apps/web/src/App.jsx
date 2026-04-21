@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   BrowserRouter,
   Link,
@@ -8,8 +8,12 @@ import {
   useNavigate,
 } from "react-router-dom";
 import Home from "./pages/home";
+import { clearAuthSession, getSavedAuthUser, isAdminUser } from "./lib/supabaseAuth";
+import Admin from "./pages/admin";
+import Login from "./pages/login";
 import Result from "./pages/result";
 import Simulate from "./pages/simulate";
+import Signup from "./pages/signup";
 
 const simulateUrlMap = {
   calvinklein: "https://www.amazon.com/-/ko/dp/B07PGR2Z62",
@@ -35,7 +39,22 @@ function normalizeSearchUrl(value) {
 
 function AppShell() {
   const [url, setUrl] = useState("");
+  const [authUser, setAuthUser] = useState(() => getSavedAuthUser());
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const syncAuthUser = () => {
+      setAuthUser(getSavedAuthUser());
+    };
+
+    window.addEventListener("buysafe:auth-changed", syncAuthUser);
+    window.addEventListener("storage", syncAuthUser);
+
+    return () => {
+      window.removeEventListener("buysafe:auth-changed", syncAuthUser);
+      window.removeEventListener("storage", syncAuthUser);
+    };
+  }, []);
 
   const handleSearch = () => {
     if (!url.trim()) {
@@ -44,6 +63,11 @@ function AppShell() {
     }
 
     navigate(`/result?url=${encodeURIComponent(normalizeSearchUrl(url))}`);
+  };
+
+  const handleLogout = () => {
+    clearAuthSession();
+    navigate("/");
   };
 
   return (
@@ -56,9 +80,35 @@ function AppShell() {
           <Link to="/simulate" className="text-sm font-medium text-slate-600">
             테스트 데이터
           </Link>
-          <button className="text-sm font-bold bg-blue-50 text-blue-600 px-4 py-2 rounded-lg">
-            로그인
-          </button>
+          {authUser ? (
+            <div className="flex items-center gap-3">
+              <span className="max-w-[180px] truncate text-sm font-bold text-slate-700">
+                {authUser.email}
+              </span>
+              {isAdminUser(authUser) && (
+                <Link
+                  to="/admin"
+                  className="text-sm font-bold bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  관리자페이지
+                </Link>
+              )}
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="text-sm font-bold bg-slate-100 text-slate-700 px-4 py-2 rounded-lg hover:bg-slate-200 transition-colors"
+              >
+                로그아웃
+              </button>
+            </div>
+          ) : (
+            <Link
+              to="/login"
+              className="text-sm font-bold bg-blue-50 text-blue-600 px-4 py-2 rounded-lg hover:bg-blue-100 transition-colors"
+            >
+              로그인
+            </Link>
+          )}
         </div>
       </nav>
       <Routes>
@@ -66,6 +116,9 @@ function AppShell() {
           path="/"
           element={<Home url={url} setUrl={setUrl} onSearch={handleSearch} />}
         />
+        <Route path="/login" element={<Login />} />
+        <Route path="/signup" element={<Signup />} />
+        <Route path="/admin" element={<Admin />} />
         <Route path="/result" element={<Result />} />
         <Route path="/simulate" element={<Navigate to="/simulate/Marshall" replace />} />
         <Route path="/simulate/:productSlug" element={<Simulate />} />
