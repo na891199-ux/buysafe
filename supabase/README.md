@@ -8,6 +8,12 @@ Run this file in Supabase SQL Editor:
 supabase/import_amazon_mock_result_tables.sql
 ```
 
+For the result-page error report workflow, run this file once as well:
+
+```text
+supabase/create_error_report_table.sql
+```
+
 The API reads data through `svc_query_log.option_json->>asin`, then joins:
 
 ```text

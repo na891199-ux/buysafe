@@ -118,6 +118,18 @@ export function saveAuthSession(session, rememberMe) {
   window.dispatchEvent(new Event("buysafe:auth-changed"));
 }
 
+function getAuthStorage() {
+  if (window.localStorage.getItem("buysafe.auth.session")) {
+    return window.localStorage;
+  }
+
+  if (window.sessionStorage.getItem("buysafe.auth.session")) {
+    return window.sessionStorage;
+  }
+
+  return null;
+}
+
 export function getSavedAuthSession() {
   const savedSession =
     window.localStorage.getItem("buysafe.auth.session") ??
@@ -141,6 +153,12 @@ export function getSavedAccessToken() {
   return savedSession?.access_token ?? savedSession?.session?.access_token ?? null;
 }
 
+export function getSavedRefreshToken() {
+  const savedSession = getSavedAuthSession();
+
+  return savedSession?.refresh_token ?? savedSession?.session?.refresh_token ?? null;
+}
+
 export function getSavedAuthUser() {
   return getSavedAuthSession()?.user ?? null;
 }
@@ -149,6 +167,54 @@ export function clearAuthSession() {
   window.localStorage.removeItem("buysafe.auth.session");
   window.sessionStorage.removeItem("buysafe.auth.session");
   window.dispatchEvent(new Event("buysafe:auth-changed"));
+}
+
+export async function refreshSavedAuthSession() {
+  const refreshToken = getSavedRefreshToken();
+  const storage = getAuthStorage();
+
+  if (!refreshToken || !storage) {
+    throw new Error("다시 로그인이 필요합니다.");
+  }
+
+  const { baseUrl, anonKey } = getAuthConfig();
+  const response = await fetch(`${baseUrl}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: {
+      apikey: anonKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      refresh_token: refreshToken,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    clearAuthSession();
+    const message = payload.msg || payload.error_description || payload.error || "로그인 세션이 만료되었습니다.";
+    throw new Error(toFriendlyAuthError(message));
+  }
+
+  const previousSession = getSavedAuthSession() ?? {};
+  const nextSession = previousSession.session
+    ? {
+        ...previousSession,
+        user: payload.user ?? previousSession.user,
+        session: {
+          ...previousSession.session,
+          ...payload,
+        },
+      }
+    : {
+        ...previousSession,
+        ...payload,
+      };
+
+  storage.setItem("buysafe.auth.session", JSON.stringify(nextSession));
+  window.dispatchEvent(new Event("buysafe:auth-changed"));
+
+  return nextSession;
 }
 
 export function redirectToSocialLogin(provider) {

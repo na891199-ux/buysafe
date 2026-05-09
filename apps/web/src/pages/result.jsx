@@ -1,7 +1,15 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
+import { API_BASE_URL, getSavedAccessToken } from "../lib/supabaseAuth";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5174";
+const reportTypeOptions = [
+  { value: "price_tax", label: "세금/금액 계산 오류" },
+  { value: "hs_code", label: "HS Code 분류 오류" },
+  { value: "regulation", label: "규제/KC 정보 오류" },
+  { value: "product_info", label: "상품 정보 오류" },
+  { value: "page_error", label: "화면/동작 오류" },
+  { value: "other", label: "기타" },
+];
 
 const newsByHsPrefix = {
   "210690": [
@@ -98,6 +106,20 @@ const formatKrw = (value) =>
     maximumFractionDigits: 0,
   }).format(Math.round(Number(value ?? 0)));
 
+function toLookupErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+
+  if (/failed to fetch|load failed|networkerror/i.test(message)) {
+    return "API 서버에 연결할 수 없습니다. API 서버가 실행 중인지 확인한 뒤 다시 조회해주세요.";
+  }
+
+  if (/fetch failed|database|supabase|db/i.test(message)) {
+    return "결과 데이터베이스에 연결할 수 없습니다. Supabase 설정 또는 네트워크 상태를 확인한 뒤 다시 조회해주세요.";
+  }
+
+  return message || "조회 결과를 불러오지 못했습니다.";
+}
+
 function calculateTotals(product, calculation, quantity) {
   const unitPriceUsd = Number(product.unitPriceUsd ?? 0);
   const shippingUsd = Number(product.shippingUsd ?? 0);
@@ -129,6 +151,12 @@ const Result = () => {
   const [quantity, setQuantity] = useState(1);
   const [unitPriceUsd, setUnitPriceUsd] = useState(0);
   const [shippingUsd, setShippingUsd] = useState(0);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportType, setReportType] = useState(reportTypeOptions[0].value);
+  const [reportDetail, setReportDetail] = useState("");
+  const [reportStatus, setReportStatus] = useState("idle");
+  const [reportMessage, setReportMessage] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     if (!url) {
@@ -147,7 +175,7 @@ const Result = () => {
           `${API_BASE_URL}/api/product-lookup?url=${encodeURIComponent(url)}`,
           { signal: controller.signal },
         );
-        const payload = await response.json();
+        const payload = await response.json().catch(() => ({}));
 
         if (!response.ok) {
           throw new Error(payload.error ?? "조회 결과를 불러오지 못했습니다.");
@@ -160,7 +188,7 @@ const Result = () => {
         setStatus("ready");
       } catch (fetchError) {
         if (fetchError.name === "AbortError") return;
-        setError(fetchError.message);
+        setError(toLookupErrorMessage(fetchError));
         setStatus("error");
       }
     }
@@ -168,7 +196,7 @@ const Result = () => {
     loadResult();
 
     return () => controller.abort();
-  }, [url]);
+  }, [url, reloadKey]);
 
   const product = lookup?.product;
   const classification = lookup?.classification;
@@ -213,6 +241,50 @@ const Result = () => {
     ];
   }, [classification]);
 
+  const submitReport = async (event) => {
+    event.preventDefault();
+
+    if (!reportDetail.trim()) {
+      setReportMessage("상세 내용을 입력해주세요.");
+      return;
+    }
+
+    setReportStatus("submitting");
+    setReportMessage("");
+
+    try {
+      const accessToken = getSavedAccessToken();
+      const response = await fetch(`${API_BASE_URL}/api/error-reports`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          asin: lookup.asin,
+          productTitle: product.title,
+          sourceUrl: lookup.source_url ?? url,
+          reportType,
+          detail: reportDetail,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "오류 신고를 저장하지 못했습니다.");
+      }
+
+      setReportStatus("submitted");
+      setReportDetail("");
+      setReportMessage("");
+      setReportOpen(false);
+      window.alert("신고가 정상적으로 접수되었습니다.");
+    } catch (submitError) {
+      setReportStatus("idle");
+      setReportMessage(submitError instanceof Error ? submitError.message : "오류 신고에 실패했습니다.");
+    }
+  };
+
   if (status === "missing-url") {
     return <StateCard title="조회할 URL이 없습니다" body="메인 페이지에서 테스트 제품 URL을 입력해주세요." />;
   }
@@ -222,7 +294,17 @@ const Result = () => {
   }
 
   if (status === "error") {
-    return <StateCard title="조회 실패" body={error} tone="error" />;
+    return (
+      <StateCard title="조회 실패" body={error} tone="error">
+        <button
+          type="button"
+          onClick={() => setReloadKey((key) => key + 1)}
+          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-black text-white hover:bg-blue-700"
+        >
+          다시 조회하기
+        </button>
+      </StateCard>
+    );
   }
 
   return (
@@ -237,12 +319,25 @@ const Result = () => {
                   분석된 상품 정보 및 수정
                 </h2>
               </div>
-              <Link
-                to={`/simulate/${lookup.slug}`}
-                className="text-sm font-black bg-blue-50 text-blue-700 px-4 py-2 rounded-lg"
-              >
-                제품 페이지
-              </Link>
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <Link
+                  to={`/simulate/${lookup.slug}`}
+                  className="text-sm font-black bg-blue-50 text-blue-700 px-4 py-2 rounded-lg"
+                >
+                  제품 페이지
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReportOpen(true);
+                    setReportStatus("idle");
+                    setReportMessage("");
+                  }}
+                  className="text-sm font-black bg-rose-50 text-rose-700 px-4 py-2 rounded-lg hover:bg-rose-100"
+                >
+                  오류 신고
+                </button>
+              </div>
             </div>
 
             <div className="space-y-4">
@@ -392,6 +487,85 @@ const Result = () => {
           ))}
         </div>
       </section>
+
+      {reportOpen && (
+        <div className="fixed inset-0 z-[60] flex items-start justify-center bg-slate-950/35 px-4 py-24">
+          <form
+            onSubmit={submitReport}
+            className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl"
+          >
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <p className="text-xs font-black text-rose-600">REPORT ISSUE</p>
+                <h3 className="mt-1 text-xl font-black text-slate-950">오류 신고</h3>
+                <p className="mt-1 text-sm text-slate-500">ASIN {lookup.asin}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReportOpen(false)}
+                className="grid h-9 w-9 place-items-center rounded-lg bg-slate-100 text-lg font-black text-slate-500 hover:bg-slate-200"
+                aria-label="신고 창 닫기"
+              >
+                ×
+              </button>
+            </div>
+
+            <label className="block">
+              <span className="block text-xs font-black text-slate-500 mb-2">오류 유형</span>
+              <select
+                className="result-input"
+                value={reportType}
+                onChange={(event) => setReportType(event.target.value)}
+              >
+                {reportTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="mt-4 block">
+              <span className="block text-xs font-black text-slate-500 mb-2">상세 내용</span>
+              <textarea
+                className="result-input min-h-[132px] resize-y"
+                value={reportDetail}
+                onChange={(event) => setReportDetail(event.target.value)}
+                placeholder="잘못 보이는 값, 기대한 내용, 재현 방법 등을 적어주세요."
+              />
+            </label>
+
+            {reportMessage && (
+              <p
+                className={`mt-3 rounded-lg px-3 py-2 text-sm font-bold ${
+                  reportStatus === "submitted"
+                    ? "bg-green-50 text-green-700"
+                    : "bg-rose-50 text-rose-700"
+                }`}
+              >
+                {reportMessage}
+              </p>
+            )}
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setReportOpen(false)}
+                className="rounded-lg bg-slate-100 px-4 py-2 text-sm font-black text-slate-700 hover:bg-slate-200"
+              >
+                닫기
+              </button>
+              <button
+                type="submit"
+                disabled={reportStatus === "submitting"}
+                className="rounded-lg bg-rose-600 px-4 py-2 text-sm font-black text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:bg-rose-300"
+              >
+                {reportStatus === "submitting" ? "접수 중" : "신고하기"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </main>
   );
 };
@@ -441,15 +615,18 @@ function RiskItem({ risk }) {
   );
 }
 
-function StateCard({ title, body, tone = "default" }) {
+function StateCard({ title, body, tone = "default", children }) {
   return (
     <main className="max-w-4xl mx-auto px-6 py-16">
       <div className={`bg-white border rounded-lg p-8 ${tone === "error" ? "border-red-200" : "border-slate-200"}`}>
         <h2 className="text-2xl font-black text-slate-900 mb-3">{title}</h2>
         <p className="text-slate-600 mb-6">{body}</p>
-        <Link className="text-blue-600 font-bold" to="/">
-          메인으로 돌아가기
-        </Link>
+        <div className="flex flex-wrap items-center gap-3">
+          {children}
+          <Link className="text-blue-600 font-bold" to="/">
+            메인으로 돌아가기
+          </Link>
+        </div>
       </div>
     </main>
   );

@@ -68,6 +68,17 @@ type Reason = {
   explanation: string;
 };
 
+type ErrorReport = {
+  report_id: number;
+  asin: string;
+  product_title: string | null;
+  source_url: string | null;
+  report_type: string;
+  detail: string;
+  status: string;
+  created_at: string;
+};
+
 type AdminUser = {
   id: string;
   email?: string;
@@ -214,6 +225,19 @@ function groupCount<T extends string | undefined | null>(values: T[]) {
   }, {});
 }
 
+function normalizeErrorReportType(value: string) {
+  const allowedTypes = new Set([
+    "price_tax",
+    "hs_code",
+    "regulation",
+    "product_info",
+    "page_error",
+    "other",
+  ]);
+
+  return allowedTypes.has(value) ? value : "";
+}
+
 async function handleAdminOverview(request: http.IncomingMessage, response: http.ServerResponse) {
   const adminUser = await requireAdmin(request, response);
 
@@ -229,6 +253,7 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
     regulationsResult,
     newsResult,
     reasonsResult,
+    reportsResult,
   ] = await Promise.all([
     listAllAuthUsers(),
     Promise.all([
@@ -243,6 +268,7 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
       countRows("svc_news_map"),
       countRows("reason_res"),
       countRows("svc_result_view_log"),
+      countRows("svc_error_report"),
     ]),
     supabase
       .from("svc_query_log")
@@ -269,6 +295,11 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
       .select("reason_id, target_type, target_id, reason_type, created_at")
       .order("created_at", { ascending: false })
       .limit(10),
+    supabase
+      .from("svc_error_report")
+      .select("report_id, asin, product_title, source_url, report_type, detail, status, created_at")
+      .order("created_at", { ascending: false })
+      .limit(50),
   ]);
 
   const tableCountsByName = Object.fromEntries(
@@ -278,6 +309,7 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
   const resultRows = queryResultsResult.data ?? [];
   const regulationRows = regulationsResult.data ?? [];
   const newsRows = newsResult.data ?? [];
+  const reportRows = (reportsResult.data ?? []) as ErrorReport[];
 
   sendJson(response, 200, {
     data: {
@@ -292,6 +324,8 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
         tableCounts: tableCountsByName,
         resultStatus: groupCount(resultRows.map((item) => item.result_status)),
         riskLevels: groupCount(regulationRows.map((item) => item.risk_level)),
+        reportStatus: groupCount(reportRows.map((item) => item.status)),
+        reportTypes: groupCount(reportRows.map((item) => item.report_type)),
         kcRequired: regulationRows.filter((item) => item.kc_required).length,
       },
       users: authUsers
@@ -320,8 +354,59 @@ async function handleAdminOverview(request: http.IncomingMessage, response: http
       regulations: regulationRows,
       news: newsRows,
       reasons: reasonsResult.data ?? [],
+      reports: reportRows,
     },
   });
+}
+
+async function handleCreateErrorReport(request: http.IncomingMessage, response: http.ServerResponse) {
+  const body = await readJsonBody(request);
+  const asin = readStringField(body, "asin").toUpperCase();
+  const productTitle = readStringField(body, "productTitle");
+  const sourceUrl = readStringField(body, "sourceUrl");
+  const reportType = normalizeErrorReportType(readStringField(body, "reportType"));
+  const detail = readStringField(body, "detail");
+  let reporterUserId: string | null = null;
+  const token = getBearerToken(request);
+
+  if (token) {
+    const { data } = await supabase.auth.getUser(token);
+    reporterUserId = data.user?.id ?? null;
+  }
+
+  if (!asin || !reportType || !detail) {
+    sendJson(response, 400, { error: "ASIN, report type, and detail are required." });
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from("svc_error_report")
+    .insert({
+      asin,
+      product_title: productTitle || null,
+      source_url: sourceUrl || null,
+      report_type: reportType,
+      detail,
+      status: "OPEN",
+      reporter_user_id: reporterUserId,
+      user_agent: request.headers["user-agent"] ?? null,
+    })
+    .select("report_id, asin, report_type, status, created_at")
+    .single();
+
+  if (error) {
+    if (error.message.includes("Could not find the table") && error.message.includes("svc_error_report")) {
+      sendJson(response, 500, {
+        error: "오류 신고 테이블이 없습니다. supabase/create_error_report_table.sql을 Supabase SQL Editor에서 먼저 실행해주세요.",
+      });
+      return;
+    }
+
+    sendJson(response, 500, { error: error.message });
+    return;
+  }
+
+  sendJson(response, 201, { data });
 }
 
 async function handleSignup(request: http.IncomingMessage, response: http.ServerResponse) {
@@ -410,6 +495,220 @@ function hsName(hsCode: string) {
   };
 
   return names[hsCode] ?? "HS classification result";
+}
+
+const mockProducts: Record<
+  string,
+  {
+    slug: string;
+    title: string;
+    brand: string;
+    category: string;
+    option: string;
+    seller: string;
+    originCountry: string;
+    unitPriceUsd: number;
+    shippingUsd: number;
+    hsCode: string;
+    confidence: number;
+    dutyRate: number;
+    kcRequired: boolean;
+    riskLevel: string;
+    regulationSummary: string;
+    combinedRiskLevel: string;
+    combinedRiskSummary: string;
+  }
+> = {
+  B0BBYF2SXX: {
+    slug: "Marshall",
+    title: "Marshall Acton III Bluetooth Home Speaker, Cream",
+    brand: "Marshall",
+    category: "Bluetooth speaker",
+    option: "Cream",
+    seller: "BuySafe Mock Store",
+    originCountry: "China",
+    unitPriceUsd: 279.99,
+    shippingUsd: 18.5,
+    hsCode: "8518220000",
+    confidence: 0.84,
+    dutyRate: 0.08,
+    kcRequired: true,
+    riskLevel: "MEDIUM",
+    regulationSummary: "Bluetooth speaker imports may require radio/KC condition review.",
+    combinedRiskLevel: "LOW",
+    combinedRiskSummary: "No repeated-order combined-tax pattern was found in mock data.",
+  },
+  B0DD8SHVZL: {
+    slug: "Sony",
+    title: "Sony MDR-M1 Professional Reference Closed Monitor Headphones",
+    brand: "Sony",
+    category: "Studio monitor headphones",
+    option: "Black",
+    seller: "BuySafe Mock Store",
+    originCountry: "Thailand",
+    unitPriceUsd: 248,
+    shippingUsd: 0,
+    hsCode: "8518309000",
+    confidence: 0.9,
+    dutyRate: 0.08,
+    kcRequired: false,
+    riskLevel: "LOW",
+    regulationSummary: "Wired headphones are treated as a low restriction risk item in mock data.",
+    combinedRiskLevel: "LOW",
+    combinedRiskSummary: "Single headphone order has low combined-tax risk.",
+  },
+  B0DBMM6S89: {
+    slug: "Garmin",
+    title: "Garmin Forerunner 55 GPS Running Smartwatch (Black) Power Bundle",
+    brand: "Garmin",
+    category: "GPS running smartwatch",
+    option: "Black",
+    seller: "BuySafe Mock Store",
+    originCountry: "Taiwan",
+    unitPriceUsd: 189,
+    shippingUsd: 0,
+    hsCode: "9102120000",
+    confidence: 0.82,
+    dutyRate: 0.08,
+    kcRequired: true,
+    riskLevel: "MEDIUM",
+    regulationSummary: "GPS/Bluetooth and built-in battery details should be reviewed before import.",
+    combinedRiskLevel: "MEDIUM",
+    combinedRiskSummary: "Repeated electronics orders may create combined-tax risk.",
+  },
+  B0DZ75TN5F: {
+    slug: "iPad",
+    title: "Apple iPad 11-inch: A16 chip, Liquid Retina Display, 128GB, Wi-Fi 6, 12MP Cameras, Touch ID, All-Day Battery Life - Blue",
+    brand: "Apple",
+    category: "Tablet computer",
+    option: "Blue / 128GB / Wi-Fi",
+    seller: "BuySafe Mock Store",
+    originCountry: "China",
+    unitPriceUsd: 299,
+    shippingUsd: 0,
+    hsCode: "8471300000",
+    confidence: 0.88,
+    dutyRate: 0,
+    kcRequired: true,
+    riskLevel: "MEDIUM",
+    regulationSummary: "Wi-Fi tablet and built-in battery conditions should be checked for personal import and KC exemption.",
+    combinedRiskLevel: "MEDIUM",
+    combinedRiskSummary: "High-value electronics can be reviewed for combined taxation on repeated orders.",
+  },
+  B07NWMVMT1: {
+    slug: "Magnesium",
+    title: "NOW Supplements, Magnesium Glycinate 100 mg, Highly Absorbable Form, 180 Tablets",
+    brand: "NOW",
+    category: "Dietary supplement",
+    option: "180 Tablets",
+    seller: "BuySafe Mock Store",
+    originCountry: "United States",
+    unitPriceUsd: 24.99,
+    shippingUsd: 5.49,
+    hsCode: "2106909099",
+    confidence: 0.76,
+    dutyRate: 0.08,
+    kcRequired: false,
+    riskLevel: "HIGH",
+    regulationSummary: "Dietary supplements require ingredient, dosage, and personal-use quantity checks.",
+    combinedRiskLevel: "MEDIUM",
+    combinedRiskSummary: "Multiple supplement purchases should be reviewed for quantity limits and combined taxation.",
+  },
+  B000SE5SY6: {
+    slug: "Omega3",
+    title: "NOW Foods Supplements, Ultra Omega-3 Molecularly Distilled and Enteric Coated, 180 Softgels",
+    brand: "NOW Foods",
+    category: "Omega-3 supplement",
+    option: "180 Softgels",
+    seller: "BuySafe Mock Store",
+    originCountry: "United States",
+    unitPriceUsd: 31.99,
+    shippingUsd: 4.99,
+    hsCode: "2106909099",
+    confidence: 0.74,
+    dutyRate: 0.08,
+    kcRequired: false,
+    riskLevel: "HIGH",
+    regulationSummary: "Omega-3 supplements may require food and ingredient import review.",
+    combinedRiskLevel: "MEDIUM",
+    combinedRiskSummary: "Supplement order history and quantity should be checked together.",
+  },
+  B07PGR2Z62: {
+    slug: "CalvinKlein",
+    title: "Calvin Klein Men's Cotton Classics 7-Pack Boxer Brief, 7 Black, Large",
+    brand: "Calvin Klein",
+    category: "Men's underwear",
+    option: "7 Black / Large",
+    seller: "BuySafe Mock Store",
+    originCountry: "Imported",
+    unitPriceUsd: 59.68,
+    shippingUsd: 0,
+    hsCode: "6107110000",
+    confidence: 0.86,
+    dutyRate: 0,
+    kcRequired: false,
+    riskLevel: "LOW",
+    regulationSummary: "General apparel has low restriction risk in mock data.",
+    combinedRiskLevel: "LOW",
+    combinedRiskSummary: "Single apparel order has low combined-tax risk.",
+  },
+};
+
+function createMockLookupProduct(asin: string) {
+  const product = mockProducts[asin];
+
+  if (!product) {
+    return null;
+  }
+
+  const customsValueKrw = Math.round((product.unitPriceUsd + product.shippingUsd) * exchangeRateKrw);
+  const isDutyFree = product.dutyRate === 0;
+  const dutyKrw = isDutyFree ? 0 : Math.round(customsValueKrw * product.dutyRate);
+  const vatKrw = isDutyFree ? 0 : Math.round((customsValueKrw + dutyKrw) * 0.1);
+
+  return {
+    asin,
+    slug: product.slug,
+    source_url: `https://www.amazon.com/dp/${asin}`,
+    product: {
+      title: product.title,
+      brand: product.brand,
+      category: product.category,
+      option: product.option,
+      seller: product.seller,
+      originCountry: product.originCountry,
+      quantity: 1,
+      unitPriceUsd: product.unitPriceUsd,
+      shippingUsd: product.shippingUsd,
+      exchangeRateKrw,
+    },
+    classification: {
+      hsCode: product.hsCode,
+      hsName: hsName(product.hsCode),
+      confidence: product.confidence,
+      reason: "Loaded from local mock data because the result database is currently unavailable.",
+    },
+    calculation: {
+      customsValueKrw,
+      dutyRate: product.dutyRate,
+      dutyKrw,
+      vatRate: 0.1,
+      vatKrw,
+      totalTaxKrw: dutyKrw + vatKrw,
+    },
+    risks: [
+      {
+        label: product.kcRequired ? "KC / import requirement" : "Import requirement",
+        level: riskLevelToUiLevel(product.riskLevel),
+        detail: product.regulationSummary,
+      },
+      {
+        label: "Combined tax risk",
+        level: riskLevelToUiLevel(product.combinedRiskLevel),
+        detail: product.combinedRiskSummary,
+      },
+    ],
+  };
 }
 
 async function single<T>(table: string, select: string, column: string, value: string | number) {
@@ -585,6 +884,17 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/error-reports") {
+    try {
+      await handleCreateErrorReport(request, response);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : "Unknown server error",
+      });
+    }
+    return;
+  }
+
   if (request.method !== "GET" || requestUrl.pathname !== "/api/product-lookup") {
     sendJson(response, 404, { error: "Not found" });
     return;
@@ -601,14 +911,32 @@ const server = http.createServer(async (request, response) => {
     const data = await lookupProduct(asin);
 
     if (!data) {
+      const mockData = createMockLookupProduct(asin);
+
+      if (mockData) {
+        sendJson(response, 200, { data: mockData, warning: "Using local mock data because no result row exists for this ASIN." });
+        return;
+      }
+
       sendJson(response, 404, { error: `No test lookup data found for ASIN ${asin}.`, asin });
       return;
     }
 
     sendJson(response, 200, { data });
   } catch (error) {
-    sendJson(response, 500, {
-      error: error instanceof Error ? error.message : "Unknown server error",
+    const message = error instanceof Error ? error.message : "Unknown server error";
+    const isDatabaseConnectionError = /fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT/i.test(message);
+    const mockData = isDatabaseConnectionError ? createMockLookupProduct(asin) : null;
+
+    if (mockData) {
+      sendJson(response, 200, { data: mockData, warning: "Using local mock data because the result database is unavailable." });
+      return;
+    }
+
+    sendJson(response, isDatabaseConnectionError ? 503 : 500, {
+      error: isDatabaseConnectionError
+        ? "결과 데이터베이스에 연결할 수 없습니다. Supabase URL, 키, 네트워크 상태를 확인해주세요."
+        : message,
     });
   }
 });

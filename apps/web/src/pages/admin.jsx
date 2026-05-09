@@ -11,6 +11,7 @@ const menus = [
   { id: "regulations", label: "규제/KC 관리", description: "위험도, KC 필요 여부, 규제 요약을 관리합니다." },
   { id: "news", label: "뉴스/고시 관리", description: "HS 코드별 참고 뉴스와 고시 링크를 관리합니다." },
   { id: "reasons", label: "판단 근거 관리", description: "분류, 세금, 규제 판단의 설명 근거를 관리합니다." },
+  { id: "reports", label: "오류 신고", description: "사용자가 접수한 조회 결과 오류를 검수합니다." },
   { id: "settings", label: "운영 설정", description: "환율, 인증 정책, 관리자 운영값을 관리합니다." },
 ];
 
@@ -54,7 +55,7 @@ function SimpleTable({ columns, rows, emptyText = "표시할 데이터가 없습
             </tr>
           ) : (
             rows.map((row, index) => (
-              <tr key={row.id ?? row.query_result_id ?? row.risk_id ?? row.news_map_id ?? row.reason_id ?? index}>
+              <tr key={row.id ?? row.query_result_id ?? row.risk_id ?? row.news_map_id ?? row.reason_id ?? row.report_id ?? index}>
                 {columns.map((column) => (
                   <td key={column.key} className="max-w-[360px] px-4 py-3 align-top text-slate-700">
                     {column.render ? column.render(row) : row[column.key] ?? "-"}
@@ -73,14 +74,16 @@ function Dashboard({ data }) {
   const tableCounts = data?.stats?.tableCounts ?? {};
   const resultStatus = data?.stats?.resultStatus ?? {};
   const riskLevels = data?.stats?.riskLevels ?? {};
+  const reportStatus = data?.stats?.reportStatus ?? {};
 
   return (
     <div className="grid gap-6">
-      <div className="grid md:grid-cols-4 gap-4">
+      <div className="grid md:grid-cols-5 gap-4">
         <StatCard label="Auth 회원" value={data?.stats?.authUsers ?? 0} detail={`관리자 ${data?.stats?.admins ?? 0}명`} />
         <StatCard label="조회 로그" value={tableCounts.svc_query_log?.count ?? 0} detail="svc_query_log" />
         <StatCard label="분석 결과" value={tableCounts.svc_query_result?.count ?? 0} detail="svc_query_result" />
         <StatCard label="활성 뉴스" value={data?.stats?.activeNews ?? 0} detail="최근 고시/뉴스 링크" />
+        <StatCard label="오류 신고" value={tableCounts.svc_error_report?.count ?? 0} detail="svc_error_report" />
       </div>
 
       <div className="grid lg:grid-cols-3 gap-4">
@@ -119,6 +122,21 @@ function Dashboard({ data }) {
                 <strong>{item.count}</strong>
               </div>
             ))}
+          </div>
+        </div>
+        <div className="bg-white border border-slate-200 rounded-lg p-5 lg:col-span-3">
+          <h3 className="font-black text-slate-950">신고 처리 상태</h3>
+          <div className="mt-4 grid gap-2 sm:grid-cols-3">
+            {Object.entries(reportStatus).length === 0 ? (
+              <p className="text-sm font-bold text-slate-500">접수된 신고가 없습니다.</p>
+            ) : (
+              Object.entries(reportStatus).map(([key, value]) => (
+                <div key={key} className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-sm">
+                  <span className="font-bold text-slate-600">{key}</span>
+                  <strong>{value}</strong>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>
@@ -178,6 +196,15 @@ const tableColumns = {
     { key: "target_id", label: "대상 ID" },
     { key: "reason_type", label: "근거 유형" },
     { key: "created_at", label: "생성일", render: (row) => formatDate(row.created_at) },
+  ],
+  reports: [
+    { key: "report_id", label: "신고 ID" },
+    { key: "asin", label: "ASIN" },
+    { key: "report_type", label: "오류 유형" },
+    { key: "product_title", label: "상품" },
+    { key: "detail", label: "상세 내용" },
+    { key: "status", label: "상태" },
+    { key: "created_at", label: "접수일", render: (row) => formatDate(row.created_at) },
   ],
 };
 
